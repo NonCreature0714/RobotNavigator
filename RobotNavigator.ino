@@ -13,11 +13,14 @@
 #define MAX_SPEED_OFFSET 10 // this sets offset to allow for differences between the two DC traction motors
 
 //Define limits and steps for servo
-#define FRONT 90
-#define LEFT_LIMIT 180
-#define RIGHT_LIMIT 0
 #define STEP_LEFT 45
 #define STEP_RIGHT -45
+#define FRONT 90
+#define FRONT_RIGHT FRONT+STEP_RIGHT
+#define FRONT_LEFT FRONT+STEP_LEFT
+#define LEFT_LIMIT 180
+#define RIGHT_LIMIT 0
+
 
 //Define limits on sensor.
 #define NUM_READINGS 5
@@ -25,6 +28,7 @@
 #define MAX_READ_ATTEMPTS 5
 #define SAMPLE_SIZE 10
 #define HISTORY_SIZE 20
+#define EMERGENCY_STOP 3
 
 //Define navigation limits.
 #define COLLISION_DISTANCE 20 // sets distance at which robot stops and reverses to 20cm
@@ -42,6 +46,59 @@ AF_DCMotor motor4(4, MOTOR12_1KHZ); // create motor #2, using M4 output, set to 
 //Instantiate the servo.
 Servo myServo;
 
+/*
+ * This Boolean value controls which protothread is active.
+ * Set it to 'true' so the robot begins scanning.
+ */
+bool isSensorReadCycle = true;
+bool scanComplete = false;
+
+//Define navigation commands.
+//Note how the values of the navigation commands are the same as sensorReadingAt array. This is not a mistake.
+const uint8_t   fullRight = 4,
+                halfRight = 3,
+                front = 2,
+                halfLeft = 1,
+                fullLeft = 0;
+
+struct LinearPath{
+    int distance;
+    int lineOfBearing;
+    uint8_t position;
+    bool isSmoothingSensorRead;
+    bool isGoodPath;
+    LinearPath * nextPath;
+    LinearPath * getNextPath(){
+        return nextPath;
+    }
+    void check(){
+        if(distance == 0){
+            isGoodPath = false;
+            return;
+        }
+        if (distance > 0 && distance < MAX_DISTANCE){
+            isGoodPath = true;
+            isSmoothingSensorRead = false;
+            return;
+        }
+        if(distance == 255 && isSmoothingSensorRead){
+            isGoodPath = false;
+        }
+    }
+    LinearPath(){
+        distance = 0;
+        lineOfBearing = 0;
+        isSmoothingSensorRead = false;
+        isGoodPath = false;
+        nextPath = 0;
+    }
+    LinearPath(int d, int l, uint8_t p, bool iS, bool iG, LinearPath * np):
+        distance(d), lineOfBearing(l), position(p), isSmoothingSensorRead(iS), isGoodPath(iG), nextPath(np)
+        {}
+};
+
+
+
 //Define movement states.
 const uint8_t rollForward = 0,
               rollBackward = 1,
@@ -49,29 +106,25 @@ const uint8_t rollForward = 0,
               turnRight = 3,
               haltWheels = 4;
 
-//Define navigation commands.
-const uint8_t   fullRight = 4,
-                halfRight = 3,
-                front = 2,
-                halfLeft = 1,
-                fullLeft = 0;
-
-
 //Declare a movement state.
 uint8_t movementState = haltWheels; //Start with a 'haltWheels' movement state.
-bool moving = false; //Detects if it's already moving.
-bool isSmoothing = false;
+
+const LinearPath * frontPtr = sensorReadingAt[2];
+const LinearPath * frontLeftPtr = sensorReadingAt[1];
+const LinearPath * leftPtr = sensorReadingAt[0];
+const LinearPath * frontRightPtr = sensorReadingAt[3];
+const LinearPath * rightPtr = sensorReadingAt[4];
 
 int sensorLineOfBearing = RIGHT_LIMIT; // this sets up variables for use in the sketch (code)
-int sensorReadingAt[NUM_READINGS] = {0};
+LinearPath sensorReadingAt[NUM_READINGS] = {LinearPath(0,LEFT_LIMIT,fullLeft,false,false,frontLeftPtr),
+                                            LinearPath(0,FRONT_LEFT,halfLeft,false,false,frontPtr),
+                                            LinearPath(0,FRONT,front,false,false,frontLeftPtr),
+                                            LinearPath(0,FRONT_RIGHT,halfRight,false,false,rightPtr),
+                                            LinearPath(0,RIGHT_LIMIT,fullRight,false,false,frontRightPtr)};
 
-int * frontPtr = sensorReadingAt[2];
-int * frontLeftPtr = sensorReadingAt[1];
-int * leftPtr = sensorReadingAt[0];
-int * frontRightPtr = sensorReadingAt[3];
-int * rightPtr = sensorReadingAt[4];
+bool sensorReadingComplete[NUM_READINGS] = {false, false, false, false, false};//Robot will only move if all sensor readings are complete.
 
-bool goodPathAt[NUM_READINGS] = {false, false, false, false, false};
+int averages[NUM_READINGS] = {0};
 
 const int LEFT_STARTING_READ_INDEX = 4;
 const int RIGHT_STARTING_READ_INDEX = 0;
@@ -81,20 +134,31 @@ int speedSetting = 0;
 const int SWEEP_READING_LEFT = -1; //True because starting sweep from right.
 const int SWEEP_READING_RIGHT = 1;
 
-int sensorRead(){
+
+/********************************************
+ *                                          *
+ *          FUNCTION DECLARATIONS           *
+ *                                          *
+ ********************************************/
+
+/*
+ *  sensorReadAlong(path) function.
+ *
+ *  Takes a Linear path as an argument,
+ *  reads 
+ */
+void sensorReadAlong(LinearPath * path){
   int numTries = 0;
-  int uSPing = 0;
   do {
-    isSmoothing = false;
+    path->isSmoothingSensorRead = false;
     ++numTries;
-    uSPing = sonar.ping_cm();
+    path->distance = sonar.ping_cm();
     if(numTries > MAX_READ_ATTEMPTS){
-        isSmoothing = true;
+        path->isSmoothingSensorRead = true;
         return MAX_DISTANCE; //If more than 5 tries, return max range.
     }
-  } while (uSPing == 0);
-  return uSPing;
-}//End of sensorRead().
+  } while (path->distance == 0);
+}//End of sensorReadAlong().
 
 int rollingAverage(int average, const int newSample){
   average -= average/SAMPLE_SIZE;
@@ -104,33 +168,42 @@ int rollingAverage(int average, const int newSample){
   return average;
 }//End of rollingAverage.
 
-int interpretDataFrom(int oldSensor, int sensor){
-    int avg = rollingAverage(oldSensor, sensor);
+int interpretDataAt(LinearPath * path, int sensorReading){
+    int avg = rollingAverage(sensorIndex, sensorReading);
     if (avg <= 0){
-        return sensor = 0;
-    } else if (avg >= 255){
-        return sensor = 255;;
+        return sensorReading = 0;
     }
-    return sensor;
+    if (avg >= 255){
+        return sensorReading = 255;
+    }
+    return sensorReading;
 }
 
-int readAndSweep(int nextStep, int startingReadIndex, int arrayStep, int lob){
-    for(int i = startingReadIndex; i<NUM_READINGS; i += arrayStep, lob += nextStep){
-        sensorReadingAt[i] = interpretDataFrom(sensorReadingAt[i], sensorRead());
-        myServo.write(lob);
-        sensorLineOfBearing = lob; //Update the global variable with the current value.
-    }
+LinearPath * currentLinearPath; //Cautious use of global pointer variable, only for use in function below.
+int readAndStep(){
+    //TODO: read along LinearPath.
+    //TODO: interpret that data.
+    //TODO: step the servo to next LinearPath.
+    //TODO: move the currentLinearPath to that sensorPath.
 }
 
-void sweepFrom(int lineOfBearing){
+void scan(LinearPath * path){
     if(lineOfBearing >= RIGHT_LIMIT && lineOfBearing < LEFT_LIMIT){
-        readAndSweep(STEP_LEFT, RIGHT_STARTING_READ_INDEX, SWEEP_READING_LEFT, lineOfBearing);
+        readAndStep(STEP_LEFT, RIGHT_STARTING_READ_INDEX, SWEEP_READING_LEFT, lineOfBearing);
     } else if(lineOfBearing <= LEFT_LIMIT && lineOfBearing > RIGHT_LIMIT){
-        readAndSweep(STEP_RIGHT, LEFT_STARTING_READ_INDEX, SWEEP_READING_RIGHT, lineOfBearing);
+        readAndStep(STEP_RIGHT, LEFT_STARTING_READ_INDEX, SWEEP_READING_RIGHT, lineOfBearing);
     }
 }
+
+
+/********************************************************
+ *                                                      *
+ *      NAVIGATION & MOVEMENT FUNCTIONS BELOW           *
+ *                                                      *
+ ********************************************************/
 
 int pickBestPath(){
+    //TODO: add pathfinding algorithm.
     int bestPath = 0;
     for(int i = 0; i<NUM_READINGS; ++i){
         if(sensorReadingAt[i] > bestPath){
@@ -230,7 +303,30 @@ void navigate(){
     move(chooseMovement());
 }
 
+/************************************************************
+ *                                                          *
+ *              SWEEP AND NAVIGATE FUNCTION                 *
+ *                                                          *
+ *  This function is what allows the Arduino to protothread,*
+ *  meaning it can handle multiple tasks seemingly at once. *
+ *                                                          *
+ ************************************************************/
 
+
+void sweepAndNavigate(){
+    if(isSensorReadCycle){
+        //TODO: Scan and turn servo.
+        if(!scanComplete){
+            isSensorReadCycle = true;
+        } else {
+            isSensorReadCycle = false;
+        }
+
+    } else {
+        //TODO: Analyse and move.
+        isSensorReadCycle = true;
+    }
+}
 
 // In some cases, the Motor Drive Shield may just stop if the supply voltage is too low (due to using only four NiMH AA cells).
 // The above functions simply remind the Shield that if it's supposed to go forward, then make sure it is going forward and vice versa.
@@ -244,6 +340,5 @@ void setup() {
 
 //---------------------------------------------MAIN LOOP ------------------------------------------------------------------------------
 void loop() {
-  sweepFrom(sensorLineOfBearing);
-  navigate();
+  sweepAndNavigate();
 }
